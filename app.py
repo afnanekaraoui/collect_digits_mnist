@@ -1,34 +1,33 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from PIL import Image
-import os
-import uuid
-import zipfile
 import io
+import uuid
 import numpy as np
 from datetime import datetime
 from supabase import create_client, Client
 from dotenv import load_dotenv
-load_dotenv() 
+import os
+import zipfile
+import base64
+
+# Load .env
+load_dotenv()
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 app = Flask(__name__)
-CORS(app)  # Enable requests from any domain
+CORS(app)
 
-# Configuration
-DATASET_ROOT = 'dataset'
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
+BUCKET_NAME = "digits"   # make sure this bucket exists
 
-def init_dataset_folders():
-    """Create folders for each digit class (0-9)"""
-    for digit in range(10):
-        folder_path = os.path.join(DATASET_ROOT, str(digit))
-        os.makedirs(folder_path, exist_ok=True)
-    print("✅ Dataset folders initialized (0-9)")
 
+# =======================================================
+# 🚀 SAVE DIGIT (UPLOAD TO SUPABASE STORAGE)
+# =======================================================
 @app.route('/save_digit', methods=['POST'])
 def save_digit():
     try:
@@ -39,189 +38,179 @@ def save_digit():
         label = request.form['label']
 
         if not label.isdigit() or int(label) not in range(10):
-            return jsonify({'error': 'Label must be 0-9'}), 400
+            return jsonify({'error': 'Label must be between 0–9'}), 400
 
-        # Process image with PIL
+        # Process image
         img = Image.open(image_file).convert('L')
         if img.size != (28, 28):
             img = img.resize((28, 28), Image.BILINEAR)
 
-        # Save to in-memory bytes
+        # Convert to bytes
         img_bytes = io.BytesIO()
         img.save(img_bytes, format='PNG')
-        img_bytes.seek(0)
+        file_bytes = img_bytes.getvalue()
 
         # Unique filename
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         unique_id = str(uuid.uuid4())[:8]
-        filename = f'digit_{label}_{timestamp}_{unique_id}.png'
-        path_in_bucket = f"{label}/{filename}"
+        filename = f"digit_{label}_{timestamp}_{unique_id}.png"
+
+        # Upload path → "0/filename.png", "1/filename.png", ...
+        upload_path = f"{label}/{filename}"
 
         # Upload to Supabase
-        res = supabase.storage.from_('digits').upload(path_in_bucket, img_bytes)
+        res = supabase.storage.from_(BUCKET_NAME).upload(upload_path, file_bytes)
 
-        if res.get("error"):
-            return jsonify({'error': res["error"]["message"]}), 500
+        if "error" in res:
+            return jsonify({"error": res["error"]["message"]}), 500
 
         return jsonify({
-            'success': True,
-            'message': f'Saved digit {label} in Supabase Storage',
-            'filename': filename,
-            'label': label
+            "success": True,
+            "filename": filename,
+            "path": upload_path
         }), 200
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/stats', methods=['GET'])
-def get_stats():
-    """Get dataset statistics"""
+
+
+# =======================================================
+# 📊 GET STATISTICS (COUNT FILES IN SUPABASE STORAGE)
+# =======================================================
+@app.route("/stats", methods=["GET"])
+def stats():
     try:
         stats = {}
         total = 0
-        
-        for digit in range(10):
-            folder_path = os.path.join(DATASET_ROOT, str(digit))
-            if os.path.exists(folder_path):
-                count = len([f for f in os.listdir(folder_path) if f.endswith('.png')])
-                stats[str(digit)] = count
-                total += count
-            else:
-                stats[str(digit)] = 0
-        
+
+        for label in range(10):
+            folder = f"{label}"
+            files = supabase.storage.from_(BUCKET_NAME).list(folder)
+
+            count = len(files)
+            stats[str(label)] = count
+            total += count
+
         return jsonify({
-            'stats': stats,
-            'total': total
-        }), 200
-        
+            "stats": stats,
+            "total": total
+        })
+
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
-# ==================== DATA RETRIEVAL ENDPOINTS ====================
 
-@app.route('/download_zip', methods=['GET'])
+
+# =======================================================
+# 📁 LIST ALL FILES FROM SUPABASE
+# =======================================================
+@app.route("/list_files", methods=["GET"])
+def list_files():
+    try:
+        result = {}
+
+        for label in range(10):
+            folder = f"{label}"
+            files = supabase.storage.from_(BUCKET_NAME).list(folder)
+            result[str(label)] = [f["name"] for f in files]
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
+# =======================================================
+# 🧩 DOWNLOAD ALL IMAGES AS ZIP (DIRECTLY FROM SUPABASE)
+# =======================================================
+@app.route("/download_zip")
 def download_zip():
-    """
-    Download entire dataset as ZIP file
-    Usage: curl http://your-server.com/download_zip -o dataset.zip
-    """
     try:
         memory_file = io.BytesIO()
-        
-        with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for digit in range(10):
-                folder_path = os.path.join(DATASET_ROOT, str(digit))
-                if os.path.exists(folder_path):
-                    for filename in os.listdir(folder_path):
-                        if filename.endswith('.png'):
-                            file_path = os.path.join(folder_path, filename)
-                            # Add to zip with folder structure
-                            zf.write(file_path, os.path.join(str(digit), filename))
-        
+
+        with zipfile.ZipFile(memory_file, "w", zipfile.ZIP_DEFLATED) as zf:
+            for label in range(10):
+                folder = f"{label}"
+                files = supabase.storage.from_(BUCKET_NAME).list(folder)
+
+                for file in files:
+                    file_path = f"{folder}/{file['name']}"
+                    file_bytes = supabase.storage.from_(BUCKET_NAME).download(file_path)
+
+                    zf.writestr(file_path, file_bytes)
+
         memory_file.seek(0)
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        zip_filename = f'mnist_dataset_{timestamp}.zip'
-        
         return send_file(
             memory_file,
-            mimetype='application/zip',
+            mimetype="application/zip",
             as_attachment=True,
-            download_name=zip_filename
+            download_name="digits_dataset.zip"
         )
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
-@app.route('/download_numpy', methods=['GET'])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
+# =======================================================
+# 🔢 DOWNLOAD NUMPY (X, y) FROM SUPABASE STORAGE
+# =======================================================
+@app.route("/download_numpy")
 def download_numpy():
-    """
-    Export dataset as NumPy arrays
-    Returns: JSON with base64-encoded arrays
-    """
     try:
         X = []
         y = []
-        
+
         for label in range(10):
-            folder_path = os.path.join(DATASET_ROOT, str(label))
-            if os.path.exists(folder_path):
-                for filename in os.listdir(folder_path):
-                    if filename.endswith('.png'):
-                        img_path = os.path.join(folder_path, filename)
-                        img = Image.open(img_path).convert('L')
-                        X.append(np.array(img))
-                        y.append(label)
-        
-        if len(X) == 0:
-            return jsonify({'error': 'No images found'}), 404
-        
+            folder = f"{label}"
+            files = supabase.storage.from_(BUCKET_NAME).list(folder)
+
+            for file in files:
+                file_path = f"{folder}/{file['name']}"
+                file_bytes = supabase.storage.from_(BUCKET_NAME).download(file_path)
+
+                img = Image.open(io.BytesIO(file_bytes)).convert("L")
+                X.append(np.array(img))
+                y.append(label)
+
         X = np.array(X)
         y = np.array(y)
-        
-        # Create ZIP with NumPy files
-        memory_file = io.BytesIO()
-        np.savez_compressed(memory_file, X=X, y=y)
-        memory_file.seek(0)
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
+
+        mem = io.BytesIO()
+        np.savez_compressed(mem, X=X, y=y)
+        mem.seek(0)
+
         return send_file(
-            memory_file,
-            mimetype='application/octet-stream',
+            mem,
+            mimetype="application/octet-stream",
             as_attachment=True,
-            download_name=f'mnist_numpy_{timestamp}.npz'
+            download_name="digits_numpy.npz"
         )
-        
+
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/list_files', methods=['GET'])
-def list_files():
-    """List all files in dataset"""
-    try:
-        files = {}
-        
-        for label in range(10):
-            folder_path = os.path.join(DATASET_ROOT, str(label))
-            if os.path.exists(folder_path):
-                files[str(label)] = [f for f in os.listdir(folder_path) if f.endswith('.png')]
-            else:
-                files[str(label)] = []
-        
-        total = sum(len(f) for f in files.values())
-        
-        return jsonify({
-            'files': files,
-            'total': total
-        }), 200
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'running',
-        'message': 'MNIST Digit Collector Backend is active'
-    }), 200
 
-@app.route('/')
+# =======================================================
+# HEALTH CHECK
+# =======================================================
+@app.route("/health")
+def health():
+    return {"status": "running"}
+
+
+
+# =======================================================
+# ROOT
+# =======================================================
+@app.route("/")
 def index():
-    return "MNIST Digit Collector Backend is running! Visit /stats or /save_digit"
+    return "MNIST Digit Collector Backend with Supabase Storage"
 
-if __name__ == '__main__':
-    print("=" * 50)
-    print("🚀 MNIST Digit Collector Backend")
-    print("=" * 50)
-    
-    init_dataset_folders()
-    
-    print(f"📁 Dataset root: {os.path.abspath(DATASET_ROOT)}")
-    print("🌐 Server starting...")
-    print("=" * 50)
-    
-    # For production deployment
-    port = int(os.environ.get('PORT', 5001))
-    app.run(debug=False, host='0.0.0.0', port=port) 
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5001))
+    app.run(host="0.0.0.0", port=port, debug=False)
