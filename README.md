@@ -1,0 +1,1 @@
+# collect_digits_mnist
