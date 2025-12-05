@@ -55,14 +55,19 @@ def save_digit():
         unique_id = str(uuid.uuid4())[:8]
         filename = f"digit_{label}_{timestamp}_{unique_id}.png"
 
-        # Upload path → "0/filename.png", "1/filename.png", ...
+        # Upload path → "0/xxx", "1/xxx"
         upload_path = f"{label}/{filename}"
 
         # Upload to Supabase
-        res = supabase.storage.from_(BUCKET_NAME).upload(upload_path, file_bytes)
+        response = supabase.storage.from_(BUCKET_NAME).upload(
+            upload_path,
+            file_bytes,
+            file_options={"content-type": "image/png"}
+        )
 
-        if "error" in res:
-            return jsonify({"error": res["error"]["message"]}), 500
+        # --- FIXED ERROR CHECK ---
+        if response.error:
+            return jsonify({"error": str(response.error)}), 500
 
         return jsonify({
             "success": True,
@@ -72,8 +77,6 @@ def save_digit():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-
 
 # =======================================================
 # 📊 GET STATISTICS (COUNT FILES IN SUPABASE STORAGE)
